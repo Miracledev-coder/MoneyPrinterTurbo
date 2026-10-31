@@ -1,3 +1,5 @@
+
+> **MoneyPrinter Studio fork:** see DEPLOY.md and `studio/`.
 <div align="center">
 
 # MoneyPrinterTurbo 💸

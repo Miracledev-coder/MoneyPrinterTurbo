@@ -552,7 +552,13 @@ def search_videos_pixabay(
             if not isinstance(video_files, dict):
                 continue
             # loop through each url to determine the best quality
-            for video_type, video in video_files.items():
+            # Prefer the smallest rendition that still meets the target size (saves RAM).
+            def _area(kv):
+                try:
+                    return int(kv[1]["width"]) * int(kv[1]["height"])
+                except Exception:
+                    return 1 << 62
+            for video_type, video in sorted(video_files.items(), key=_area):
                 if not isinstance(video, dict):
                     continue
                 try:

@@ -441,6 +441,11 @@ def _write_videofile_with_codec_fallback(
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
     """
     kwargs.setdefault("ffmpeg_params", _BT709_FFMPEG_PARAMS)
+    if os.environ.get("MPT_X264_PRESET"):
+        # Low-memory hosting: faster preset + short lookahead keeps x264 RAM small.
+        kwargs.setdefault("preset", os.environ["MPT_X264_PRESET"])
+        kwargs["threads"] = int(os.environ.get("MPT_FFMPEG_THREADS", "1"))
+        kwargs["ffmpeg_params"] = list(kwargs["ffmpeg_params"] or []) + ["-rc-lookahead", "8"]
     if atomic_output:
         # Final videos can be downloaded by path while they are being rendered.
         # Keep both failed encodes and in-progress writes away from that path.
@@ -668,6 +673,8 @@ def concat_video_clips_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
         ]
+        if os.environ.get("MPT_X264_PRESET") and "264" in codec:
+            command[-4:-4] = ["-preset", os.environ["MPT_X264_PRESET"], "-rc-lookahead", "8"]
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(staged_output)
@@ -1599,6 +1606,73 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+def _ass_color(hex_color, alpha="00"):
+    h = (hex_color or "#FFFFFF").lstrip("#")
+    if len(h) == 8:
+        alpha, h = h[6:8], h[:6]
+        alpha = "%02X" % (255 - int(alpha, 16))
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    return f"&H{alpha}{b}{g}{r}".upper()
+
+
+def _ffmpeg_final_render(video_path, audio_path, subtitle_path, output_file, params,
+                         bgm_file_override, width, height) -> bool:
+    """Low-memory final render: one ffmpeg process (libass subtitles + audio mix),
+    no MoviePy frame pipeline. Used on 512MB hosts (MPT_FFMPEG_FINAL=1)."""
+    import subprocess
+    ffmpeg = utils.get_ffmpeg_binary() if hasattr(utils, "get_ffmpeg_binary") else "ffmpeg"
+    bgm = ""
+    if params.bgm_type:
+        try:
+            bgm = (bgm_file_override if bgm_file_override is not None else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)) or ""
+        except Exception as exc:
+            logger.warning(f"bgm unavailable: {exc}")
+    cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", video_path, "-i", audio_path]
+    if bgm:
+        cmd += ["-stream_loop", "-1", "-i", bgm]
+    vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+    if params.subtitle_enabled and subtitle_path and os.path.exists(subtitle_path):
+        font_file = os.path.join(utils.font_dir(), params.font_name or "")
+        font_family = os.path.splitext(os.path.basename(font_file))[0].replace("-", " ")
+        try:
+            from PIL import ImageFont
+            font_family = ImageFont.truetype(font_file, 10).getname()[0]
+        except Exception:
+            pass
+        pos = params.subtitle_position or "bottom"
+        align = {"top": 8, "center": 5}.get(pos, 2)
+        # libass scales styles from PlayResY=288 by default; convert pixel size.
+        fs = max(8, round((params.font_size or 48) * 288 / height))
+        bg = params.text_background_color
+        boxed = (isinstance(bg, str) and bg != "") or bg is True
+        style = [f"FontName={font_family}", f"FontSize={fs}", f"PrimaryColour={_ass_color(params.text_fore_color)}",
+                 f"OutlineColour={_ass_color(params.stroke_color)}", f"Alignment={align}",
+                 f"MarginV={round(288 * 0.08)}", "Bold=0"]
+        if boxed:
+            style += ["BorderStyle=3", f"BackColour={_ass_color(bg if isinstance(bg, str) else '#000000AA')}",
+                      f"OutlineColour={_ass_color(bg if isinstance(bg, str) else '#000000AA')}", "Outline=6", "Shadow=0"]
+        else:
+            style += ["BorderStyle=1", f"Outline={max(0.0, (params.stroke_width or 0)) * 288 / height * 1.5:.2f}", "Shadow=0"]
+        sub = subtitle_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        fdir = utils.font_dir().replace(":", "\\:")
+        vf += f",subtitles='{sub}':fontsdir='{fdir}':force_style='{','.join(style)}'"
+    vol = params.voice_volume or 1.0
+    if bgm:
+        af = (f"[1:a]volume={vol}[v];[2:a]volume={params.bgm_volume or 0.2}[m];"
+              f"[v][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
+    else:
+        af = f"[1:a]volume={vol}[a]"
+    cmd += ["-filter_complex", f"[0:v]{vf}[vo];{af}", "-map", "[vo]", "-map", "[a]", "-shortest",
+            "-c:v", "libx264", "-preset", os.environ.get("MPT_X264_PRESET", "veryfast"), "-crf", "23",
+            "-pix_fmt", "yuv420p", "-threads", os.environ.get("MPT_FFMPEG_THREADS", "1"),
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output_file]
+    logger.info("rendering final video with a single ffmpeg pass (low-memory mode)")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg final render failed: {r.stderr[-500:]}")
+    return True
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1627,6 +1701,10 @@ def generate_video(
     # PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'final-1.mp4.tempTEMP_MPY_wvf_snd.mp3'
     # write into the same directory as the output file
     output_dir = os.path.dirname(output_file)
+
+    if os.environ.get("MPT_FFMPEG_FINAL") == "1":
+        return _ffmpeg_final_render(video_path, audio_path, subtitle_path, output_file,
+                                    params, bgm_file_override, video_width, video_height)
 
     font_path = ""
     if params.subtitle_enabled:

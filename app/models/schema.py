@@ -31,6 +31,10 @@ class VideoTransitionMode(str, Enum):
     zoom_out = "ZoomOut"
 
 
+import os as _os
+_LOWRES = _os.environ.get("MPT_MAX_720P", "1") == "1"
+
+
 class VideoAspect(str, Enum):
     landscape = "16:9"
     portrait = "9:16"
@@ -38,11 +42,11 @@ class VideoAspect(str, Enum):
 
     def to_resolution(self):
         if self == VideoAspect.landscape:
-            return 1920, 1080
+            return (1280, 720) if _LOWRES else (1920, 1080)
         elif self == VideoAspect.portrait:
-            return 1080, 1920
+            return (720, 1280) if _LOWRES else (1080, 1920)
         elif self == VideoAspect.square:
-            return 1080, 1080
+            return (720, 720) if _LOWRES else (1080, 1080)
         raise ValueError(f"unsupported video aspect: {self}")
 
 
