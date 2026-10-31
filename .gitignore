@@ -47,3 +47,4 @@ htmlcov/
 .env
 USERS_PRIVATE.txt
 /*.png
+.github/
